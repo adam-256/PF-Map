@@ -68,7 +68,11 @@ class ClubRepository(private val context: Context) {
         // missing or stale - the GitHub sources are the normal path.
         if (current == null || current.clubs.isEmpty() || isStale(current)) {
             try {
-                return@withContext saveAndDiff(current, fetchFromAllThePlaces())
+                val atp = fetchFromAllThePlaces()
+                // That crawl is often partial; never let it replace a substantially bigger list.
+                val floor = (current?.clubs?.size ?: 0) * 85 / 100
+                if (atp.clubs.size < floor) error("partial crawl (${atp.clubs.size} clubs)")
+                return@withContext saveAndDiff(current, atp)
             } catch (e: Exception) {
                 errors += "alltheplaces: ${e.message}"
             }
