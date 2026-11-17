@@ -5,10 +5,13 @@ planetfitness.com sits behind a Cloudflare bot wall, so instead of scraping it
 we use open datasets that already track the official club pages:
 
 1. All the Places (CC0) - its `planet_fitness_us` spider crawls
-   planetfitness.com/clubs weekly and publishes GeoJSON. We take the newest run
-   that looks complete (walking back through run history if the latest is short).
+   planetfitness.com/clubs weekly and publishes GeoJSON. That crawl is often
+   partial (Cloudflare), so we union the last ~10 weeks of runs by club id,
+   newest record winning, salvaging truncated files line by line.
 2. OpenStreetMap (ODbL) via Overpass - every feature tagged with the Planet
-   Fitness brand (Wikidata Q7201095) - used only if All the Places fails.
+   Fitness brand (Wikidata Q7201095) - adds clubs with no ATP club within 300 m.
+
+A run that would shrink the published list by more than 15% is refused.
 
 Output (stable, sorted, so diffs are meaningful):
   data/clubs.json       {version, generated, source, count, clubs:[...]}
@@ -23,23 +26,29 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import re
 import sys
+import time
 import urllib.parse
 import urllib.request
 
 ATP_LATEST = "https://data.alltheplaces.xyz/runs/latest.json"
 ATP_HISTORY = "https://data.alltheplaces.xyz/runs/history.json"
 ATP_SPIDER = "planet_fitness_us"
-OVERPASS = "https://overpass-api.de/api/interpreter"
+OVERPASS_MIRRORS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+]
 OVERPASS_QUERY = """[out:json][timeout:300];
 area["ISO3166-1"="US"][admin_level=2]->.us;
 nwr["brand:wikidata"="Q7201095"](area.us);
 out center tags;"""
 
-# There are ~2,700 U.S. clubs. Anything far below that is a broken crawl.
-MIN_CLUBS = 1800
+# There are ~2,700 U.S. clubs. Anything far below that means the sources are broken.
+MIN_CLUBS = 1500
 UA = "pf-map-data-updater/1.0 (+https://github.com/adam-256/pf-map)"
 
 US_STATES = {
@@ -138,7 +147,25 @@ def parse_overpass(data: dict) -> list[dict]:
     return clubs
 
 
-def from_atp(max_runs: int = 6) -> tuple[list[dict], str]:
+def load_geojson(raw: bytes) -> dict:
+    """ATP writes one feature per line; crawls killed mid-write leave truncated files.
+    Fall back to salvaging every complete feature line."""
+    try:
+        return json.loads(raw)
+    except ValueError:
+        feats = []
+        for line in raw.decode("utf-8", "replace").splitlines():
+            line = line.strip().rstrip(",")
+            if line.startswith("{") and '"Feature"' in line:
+                try:
+                    feats.append(json.loads(line))
+                except ValueError:
+                    pass
+        return {"features": feats}
+
+
+def from_atp(max_runs: int = 12, max_age_days: int = 70) -> list[tuple[str, list[dict]]]:
+    """Every readable recent ATP run, newest first. The PF crawl is often partial, so callers merge them."""
     runs = []
     try:
         runs.append(json.loads(fetch(ATP_LATEST)))
@@ -147,31 +174,74 @@ def from_atp(max_runs: int = 6) -> tuple[list[dict], str]:
     try:
         hist = json.loads(fetch(ATP_HISTORY))
         hist = sorted(hist, key=lambda r: r.get("run_id", ""), reverse=True)
-        runs += [r for r in hist if r.get("run_id") not in {x.get("run_id") for x in runs}]
+        seen = {x.get("run_id") for x in runs}
+        runs += [r for r in hist if r.get("run_id") not in seen]
     except Exception as e:  # noqa: BLE001
         print(f"ATP history.json failed: {e}", file=sys.stderr)
 
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=max_age_days)).strftime("%Y-%m-%d")
+    results = []
     for run in runs[:max_runs]:
-        run_id = run.get("run_id")
+        run_id = run.get("run_id", "")
+        if run_id[:10] < cutoff:
+            break
         out = run.get("output_url", "")
         base = out.rsplit("/", 1)[0] if out else f"https://alltheplaces-data.openaddresses.io/runs/{run_id}"
-        url = f"{base}/output/{ATP_SPIDER}.geojson"
         try:
-            clubs = parse_atp(json.loads(fetch(url)))
+            clubs = parse_atp(load_geojson(fetch(f"{base}/output/{ATP_SPIDER}.geojson")))
         except Exception as e:  # noqa: BLE001
             print(f"ATP run {run_id}: {e}", file=sys.stderr)
             continue
         print(f"ATP run {run_id}: {len(clubs)} clubs", file=sys.stderr)
-        if len(clubs) >= MIN_CLUBS:
-            return clubs, f"All the Places run {run_id} (CC0), crawled from planetfitness.com/clubs"
-    return [], ""
+        if clubs:
+            results.append((run_id, clubs))
+    return results
 
 
-def from_osm() -> tuple[list[dict], str]:
+def from_osm() -> list[dict]:
     body = urllib.parse.urlencode({"data": OVERPASS_QUERY}).encode()
-    clubs = parse_overpass(json.loads(fetch(OVERPASS, data=body, timeout=360)))
-    print(f"OpenStreetMap: {len(clubs)} clubs", file=sys.stderr)
-    return clubs, "OpenStreetMap contributors (ODbL), brand:wikidata=Q7201095"
+    for attempt in range(2):
+        for url in OVERPASS_MIRRORS:
+            try:
+                clubs = parse_overpass(json.loads(fetch(url, data=body, timeout=360)))
+                print(f"OpenStreetMap ({url}): {len(clubs)} clubs", file=sys.stderr)
+                return clubs
+            except Exception as e:  # noqa: BLE001
+                print(f"Overpass {url} attempt {attempt + 1}: {e}", file=sys.stderr)
+        time.sleep(20)
+    return []
+
+
+def merge_runs(runs: list[tuple[str, list[dict]]]) -> list[dict]:
+    """Union of clubs across runs by id; the newest run's record wins."""
+    merged: dict[str, dict] = {}
+    for _, clubs in runs:  # newest first
+        for c in clubs:
+            merged.setdefault(c["id"], c)
+    return list(merged.values())
+
+
+def _dist_m(a: dict, b: dict) -> float:
+    k = 111_320.0
+    dx = (a["lng"] - b["lng"]) * k * math.cos(math.radians((a["lat"] + b["lat"]) / 2))
+    dy = (a["lat"] - b["lat"]) * k
+    return math.hypot(dx, dy)
+
+
+def add_missing(base: list[dict], extra: list[dict], radius_m: float = 300) -> list[dict]:
+    """Add clubs from `extra` that have no club in `base` within radius_m."""
+    grid: dict[tuple[int, int], list[dict]] = {}
+    cell = lambda c: (int(math.floor(c["lat"] * 100)), int(math.floor(c["lng"] * 100)))  # noqa: E731  ~1 km cells
+    for c in base:
+        grid.setdefault(cell(c), []).append(c)
+    added = []
+    for c in extra:
+        cy, cx = cell(c)
+        near = any(_dist_m(c, o) < radius_m for dy in (-1, 0, 1) for dx in (-1, 0, 1) for o in grid.get((cy + dy, cx + dx), []))
+        if not near:
+            added.append(c)
+            grid.setdefault((cy, cx), []).append(c)
+    return base + added
 
 
 def dedupe(clubs: list[dict]) -> list[dict]:
@@ -198,18 +268,32 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out-dir", default="data")
     ap.add_argument("--source", choices=["auto", "atp", "osm"], default="auto")
+    ap.add_argument("--force", action="store_true", help="publish even if the list shrank by >15%%")
     args = ap.parse_args()
 
-    clubs, source = [], ""
-    if args.source in ("auto", "atp"):
-        clubs, source = from_atp()
-    if not clubs and args.source in ("auto", "osm"):
-        try:
-            clubs, source = from_osm()
-        except Exception as e:  # noqa: BLE001
-            print(f"Overpass failed: {e}", file=sys.stderr)
-    if len(clubs) < (MIN_CLUBS if args.source != "osm" else 500):
-        print(f"Refusing to publish: only {len(clubs)} clubs found", file=sys.stderr)
+    atp_runs = from_atp() if args.source in ("auto", "atp") else []
+    clubs = merge_runs(atp_runs)
+    parts = []
+    if atp_runs:
+        ids = [r for r, _ in atp_runs]
+        parts.append(f"All the Places (CC0) crawls of planetfitness.com, {ids[-1][:10]} to {ids[0][:10]}: {len(clubs)}")
+    if args.source in ("auto", "osm"):
+        osm = from_osm()
+        before = len(clubs)
+        clubs = add_missing(clubs, osm)
+        if osm:
+            parts.append(f"OpenStreetMap (ODbL): +{len(clubs) - before}")
+    source = "; ".join(parts)
+    print(f"Merged: {len(clubs)} clubs ({source})", file=sys.stderr)
+
+    previous = 0
+    try:
+        with open(f"{args.out_dir}/clubs-meta.json") as fh:
+            previous = int(json.load(fh).get("count", 0))
+    except (OSError, ValueError):
+        pass
+    if len(clubs) < MIN_CLUBS or (not args.force and len(clubs) < previous * 0.85):
+        print(f"Refusing to publish: {len(clubs)} clubs (previous {previous}, minimum {MIN_CLUBS})", file=sys.stderr)
         return 1
 
     full, meta = build(clubs, source)
