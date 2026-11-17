@@ -1,0 +1,79 @@
+name: Update club list
+
+# Refreshes data/clubs.json from open data and publishes it as the "clubs-data" release,
+# which the app polls on every startup.
+on:
+  schedule:
+    - cron: "17 9 * * *" # daily
+  workflow_dispatch:
+  push:
+    paths:
+      - scripts/update_clubs.py
+      - .github/workflows/update-clubs.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-clubs
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test data script
+        run: python -m unittest discover -s scripts -v
+
+      - name: Fetch club list
+        run: python scripts/update_clubs.py --out-dir data
+
+      - name: Summary
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, collections
+          d = json.load(open("data/clubs.json"))
+          by_state = collections.Counter(c["state"] for c in d["clubs"])
+          print(f"### {d['count']} clubs · version `{d['version']}`\n\nSource: {d['source']}\n")
+          print("| State | Clubs |\n|---|---|")
+          for s, n in sorted(by_state.items()): print(f"| {s or '?'} | {n} |")
+          PY
+
+      - name: Commit if changed
+        id: commit
+        run: |
+          git add data/clubs.json data/clubs-meta.json
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Club list unchanged."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "Update club list ($(jq -r .count data/clubs-meta.json) clubs)"
+            git push
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish clubs-data release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view clubs-data >/dev/null 2>&1; then
+            gh release create clubs-data --title "Club list (data)" --latest=false \
+              --notes "Machine-updated Planet Fitness club list polled by the app on startup. Not an app release."
+            changed=true
+          else
+            changed="${{ steps.commit.outputs.changed }}"
+            # Re-publish if the release assets are missing or stale.
+            remote=$(gh release download clubs-data -p clubs-meta.json -O - 2>/dev/null | jq -r .version || true)
+            [ "$remote" != "$(jq -r .version data/clubs-meta.json)" ] && changed=true
+          fi
+          if [ "$changed" = "true" ]; then
+            gh release upload clubs-data data/clubs.json data/clubs-meta.json --clobber
+          fi

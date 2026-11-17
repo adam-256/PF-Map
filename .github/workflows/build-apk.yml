@@ -1,0 +1,91 @@
+name: Build APK
+
+on:
+  push:
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+  workflow_run:
+    # Rebuild after the club list changes so the APK bundles a fresh snapshot.
+    workflows: ["Update club list"]
+    types: [completed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # For workflow_run, build the newest commit of the branch the data job updated.
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Ensure a bundled club snapshot
+        run: |
+          if [ ! -s data/clubs.json ]; then
+            python3 scripts/update_clubs.py --out-dir data || echo "::warning::No club snapshot bundled; the app will download it on first launch."
+          fi
+
+      - name: Optional release signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+            echo "RELEASE_KEYSTORE_FILE=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
+          fi
+
+      - name: Unit tests + release APK
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+          PLACES_API_KEY: ${{ secrets.PLACES_API_KEY }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon testDebugUnitTest assembleRelease
+
+      - name: Rename APK
+        id: apk
+        run: |
+          version="1.0.${{ github.run_number }}"
+          cp app/build/outputs/apk/release/app-release.apk "pf-map.apk"
+          cp app/build/outputs/apk/release/app-release.apk "pf-map-$version.apk"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          count=$(jq -r '.count // 0' data/clubs.json 2>/dev/null || echo 0)
+          echo "clubs=$count" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pf-map-${{ steps.apk.outputs.version }}
+          path: pf-map-${{ steps.apk.outputs.version }}.apk
+
+      - name: Publish "latest" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="PF Map ${{ steps.apk.outputs.version }} · built from \`${GITHUB_SHA::7}\` · bundles ${{ steps.apk.outputs.clubs }} clubs (the app also checks for a newer club list on every launch).
+
+          **Install:** download \`pf-map.apk\` on your Android phone and open it (allow installs from your browser when asked)."
+          if gh release view latest >/dev/null 2>&1; then
+            gh release edit latest --title "PF Map ${{ steps.apk.outputs.version }}" --notes "$notes"
+            # Keep only the newest versioned APK next to the stable pf-map.apk name.
+            gh release view latest --json assets -q '.assets[].name' | grep '^pf-map-1\.' | \
+              xargs -r -n1 gh release delete-asset latest -y
+          else
+            gh release create latest --title "PF Map ${{ steps.apk.outputs.version }}" --notes "$notes" --target "$GITHUB_SHA" --latest
+          fi
+          gh release upload latest pf-map.apk "pf-map-${{ steps.apk.outputs.version }}.apk" --clobber
