@@ -58,6 +58,13 @@ class UpdateClubsTest(unittest.TestCase):
                {"id": "far", "lat": 40.05, "lng": -75.0}]      # ~5.5 km away -> new club
         self.assertEqual([c["id"] for c in u.add_missing(base, osm)], ["atp", "far"])
 
+    def test_fill_addresses_reuses_previous(self):
+        club = {"id": "osm-n1", "name": "Planet Fitness", "street": "", "city": "", "state": "", "zip": "",
+                "lat": 38.9, "lng": -92.3}
+        prev = {"osm-n1": dict(club, street="1 Main St", city="Columbia", state="MO", zip="65201")}
+        self.assertEqual(u.fill_addresses([club], prev, limit=0), 0)
+        self.assertEqual((club["city"], club["state"], club["name"]), ("Columbia", "MO", "Planet Fitness Columbia"))
+
 
 if __name__ == "__main__":
     unittest.main()

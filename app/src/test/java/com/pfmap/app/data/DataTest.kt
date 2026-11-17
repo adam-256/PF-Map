@@ -48,6 +48,10 @@ class DataTest {
         assertEquals(listOf("Mon–Fri 12 AM–12 AM"), Hours.humanize("Mo-Fr 00:00-24:00"))
         assertEquals(listOf("Sun 9:30 AM–6 PM"), Hours.humanize("Su 09:30-18:00"))
         assertEquals(emptyList<String>(), Hours.humanize(""))
+        assertEquals(
+            listOf("Sun 10 AM–6 PM", "Mon–Fri 8 AM–8 PM", "Sat 9 AM–5 PM"),
+            Hours.humanize("Su 10:00-18:00, Mo-Fr 08:00-20:00, Sa 09:00-17:00"),
+        )
     }
 
     @Test fun decodesPublishedFile() {

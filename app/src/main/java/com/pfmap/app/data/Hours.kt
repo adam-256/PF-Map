@@ -4,13 +4,15 @@ package com.pfmap.app.data
 object Hours {
     private val days = mapOf("Mo" to "Mon", "Tu" to "Tue", "We" to "Wed", "Th" to "Thu", "Fr" to "Fri", "Sa" to "Sat", "Su" to "Sun", "PH" to "Holidays")
     private val time = Regex("""\b(\d{1,2}):(\d{2})\b""")
+    private val nextRule = Regex(""",\s+(?=(?:Mo|Tu|We|Th|Fr|Sa|Su|PH)\b)""")
     private val day = Regex("""\b(Mo|Tu|We|Th|Fr|Sa|Su|PH)\b""")
 
     fun humanize(raw: String): List<String> {
         val s = raw.trim()
         if (s.isEmpty()) return emptyList()
         if (s == "24/7" || s.equals("Mo-Su 00:00-24:00", true)) return listOf("Open 24/7")
-        return s.split(';').map { it.trim() }.filter { it.isNotEmpty() }.map { rule ->
+        // Rules are separated by ";" (and, in some OSM data, by ", " before the next day range).
+        return s.split(';').flatMap { it.split(nextRule) }.map { it.trim() }.filter { it.isNotEmpty() }.map { rule ->
             var r = day.replace(rule) { days.getValue(it.value) }
             r = r.replace("off", "Closed").replace("-", "–")
             time.replace(r) { m -> clock(m.groupValues[1].toInt(), m.groupValues[2].toInt()) }

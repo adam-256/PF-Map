@@ -244,6 +244,47 @@ def add_missing(base: list[dict], extra: list[dict], radius_m: float = 300) -> l
     return base + added
 
 
+NOMINATIM = "https://nominatim.openstreetmap.org/reverse"
+
+
+def fill_addresses(clubs: list[dict], previous: dict[str, dict], limit: int = 400) -> int:
+    """Reverse-geocode clubs that have coordinates but no address (mostly OSM entries).
+
+    Results are carried over from the previous published list by id, so each club is looked up
+    once; new lookups are rate-limited to 1/s per the Nominatim usage policy."""
+    looked_up = 0
+    for c in clubs:
+        if c["street"] and c["city"] and c["state"]:
+            continue
+        old = previous.get(c["id"])
+        if old and old.get("city") and abs(old["lat"] - c["lat"]) < 1e-4 and abs(old["lng"] - c["lng"]) < 1e-4:
+            for k in ("street", "city", "state", "zip", "name"):
+                c[k] = c[k] or old.get(k, "")
+            continue
+        if looked_up >= limit:
+            continue
+        looked_up += 1
+        q = urllib.parse.urlencode({"format": "jsonv2", "lat": c["lat"], "lon": c["lng"], "zoom": 18, "addressdetails": 1})
+        try:
+            a = json.loads(fetch(f"{NOMINATIM}?{q}", timeout=30)).get("address", {})
+        except Exception as e:  # noqa: BLE001
+            print(f"Nominatim {c['id']}: {e}", file=sys.stderr)
+            time.sleep(1.1)
+            continue
+        time.sleep(1.1)
+        street = " ".join(x for x in (a.get("house_number", ""), a.get("road", "")) if x)
+        city = a.get("city") or a.get("town") or a.get("village") or a.get("hamlet") or a.get("suburb") or ""
+        state = (a.get("ISO3166-2-lvl4") or "").removeprefix("US-")
+        c["street"] = c["street"] or street
+        c["city"] = c["city"] or city
+        c["state"] = c["state"] or (state if state in US_STATES else "")
+        c["zip"] = c["zip"] or (a.get("postcode") or "")[:10]
+    for c in clubs:
+        if c["name"] == "Planet Fitness" and c["city"]:
+            c["name"] = f"Planet Fitness {c['city']}"
+    return looked_up
+
+
 def dedupe(clubs: list[dict]) -> list[dict]:
     seen: dict[str, dict] = {}
     for c in clubs:
@@ -268,6 +309,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out-dir", default="data")
     ap.add_argument("--source", choices=["auto", "atp", "osm"], default="auto")
+    ap.add_argument("--no-geocode", action="store_true", help="skip Nominatim address lookup")
     ap.add_argument("--force", action="store_true", help="publish even if the list shrank by >15%%")
     args = ap.parse_args()
 
@@ -286,12 +328,17 @@ def main() -> int:
     source = "; ".join(parts)
     print(f"Merged: {len(clubs)} clubs ({source})", file=sys.stderr)
 
-    previous = 0
+    previous, prev_clubs = 0, {}
     try:
         with open(f"{args.out_dir}/clubs-meta.json") as fh:
             previous = int(json.load(fh).get("count", 0))
-    except (OSError, ValueError):
+        with open(f"{args.out_dir}/clubs.json") as fh:
+            prev_clubs = {c["id"]: c for c in json.load(fh).get("clubs", [])}
+    except (OSError, ValueError, KeyError):
         pass
+    if not args.no_geocode:
+        n = fill_addresses(clubs, prev_clubs)
+        print(f"Reverse-geocoded {n} clubs without an address", file=sys.stderr)
     if len(clubs) < MIN_CLUBS or (not args.force and len(clubs) < previous * 0.85):
         print(f"Refusing to publish: {len(clubs)} clubs (previous {previous}, minimum {MIN_CLUBS})", file=sys.stderr)
         return 1
