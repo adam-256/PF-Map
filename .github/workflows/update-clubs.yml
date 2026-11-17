@@ -56,7 +56,11 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git commit -m "Update club list ($(jq -r .count data/clubs-meta.json) clubs)"
-            git push
+            # Someone may have pushed while we were crawling; replay our data commit on top.
+            for i in 1 2 3; do
+              git pull --rebase origin "$GITHUB_REF_NAME" && git push origin "HEAD:$GITHUB_REF_NAME" && break
+              sleep $((i * 10))
+            done
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
